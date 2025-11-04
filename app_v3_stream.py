@@ -21,6 +21,7 @@ import hashlib
 # 폰트 경로 설정 (Nanum Gothic 폰트)
 FONT_PATH_REGULAR = "./www/fonts/NanumGothic-Regular.ttf"
 FONT_PATH_BOLD = "./www/fonts/NanumGothic-Bold.ttf"
+REPORT_MONTH = 12  # 명세서 기준 월 (12월 데이터 사용)
 
 
 
@@ -568,13 +569,17 @@ def load_train_pf_dataset() -> pd.DataFrame:
 # =========================================
 # 비교 테이블 데이터 생성 (app.py 원본)
 # =========================================
-def create_comparison_table_data(train_df, results_df):
+def create_comparison_table_data(train_df, results_df, target_month):
     if train_df is None or results_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), f"{target_month}월 평균"
     try:
-        # 1. 지난 달 (11월) 평균
-        nov_df = train_df[train_df["월"] == 11].copy()
-        nov_hourly_avg = nov_df.groupby("시간")["전기요금(원)"].mean()
+        base_label = f"{target_month}월 평균"
+        base_df = train_df[train_df["월"] == target_month].copy()
+        if not base_df.empty:
+            base_series = base_df.groupby("시간")["전기요금(원)"].mean()
+        else:
+            # 학습 데이터에 대상 월이 없으면 결과 데이터로 대체
+            base_series = results_df.groupby("시간")["예측요금(원)"].mean()
 
         # 2. 어제 (Yesterday)
         latest_datetime = results_df["측정일시"].iloc[-1]
@@ -598,18 +603,18 @@ def create_comparison_table_data(train_df, results_df):
         # 4. DataFrame으로 통합
         comp_df = pd.DataFrame(
             {
-                "11월 평균": nov_hourly_avg,
+                base_label: base_series,
                 "어제": yesterday_hourly,
                 "오늘": today_hourly,
             }
         ).reindex(range(24))
         comp_df["전일 대비"] = comp_df["오늘"] - comp_df["어제"].fillna(0)
 
-        return comp_df.fillna(np.nan)
+        return comp_df.fillna(np.nan), base_label
 
     except Exception as e:
         st.error(f"비교 테이블 데이터 생성 중 오류 발생: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), f"{target_month}월 평균"
 
 
 # =========================================
@@ -626,25 +631,43 @@ def generate_bill_pdf(report_data, comparison_df=None):
         # 3. (날짜 헤더 추가)
         yesterday_header = f"어제 ({report_data.get('yesterday_str', '')})"
         today_header = f"오늘 ({report_data.get('today_str', '')})"
+        month_label = report_data.get("report_month_label", "12월")
+        base_label = report_data.get("comparison_base_label", f"{month_label} 평균")
 
         # --- 1~4. 상단 정보
         pdf.set_font_size(18)
-        pdf.cell(0, 15, "12월 실시간 예측 전기요금 명세서", border=1, ln=1, align="C")
+        pdf.cell(0, 15, f"{month_label} 실시간 예측 전기요금 명세서", border=1, ln=1, align="C")
         pdf.ln(3)
 
         pdf.set_font_size(12)
         pdf.cell(0, 8, " [ 예측 고객 정보 ]", border="B", ln=1)
         col_width = pdf.w / 2 - 12
         pdf.cell(col_width, 8, "고객명: LS 청주공장", border=0)
+        report_date = report_data.get("report_date")
+        if isinstance(report_date, pd.Timestamp) and pd.notna(report_date):
+            report_date_str = report_date.strftime("%Y-%m-%d")
+        else:
+            report_date_str = str(report_date)
+
         pdf.cell(
             col_width,
             8,
-            f"명세서 발행일: {report_data['report_date'].strftime('%Y-%m-%d')}",
+            f"명세서 발행일: {report_date_str}",
             border=0,
             ln=1,
         )
-        start_str = report_data["period_start"].strftime("%Y-%m-%d %H:%M")
-        end_str = report_data["period_end"].strftime("%Y-%m-%d %H:%M")
+        period_start = report_data.get("period_start")
+        period_end = report_data.get("period_end")
+        start_str = (
+            period_start.strftime("%Y-%m-%d %H:%M")
+            if isinstance(period_start, pd.Timestamp) and pd.notna(period_start)
+            else "-"
+        )
+        end_str = (
+            period_end.strftime("%Y-%m-%d %H:%M")
+            if isinstance(period_end, pd.Timestamp) and pd.notna(period_end)
+            else "-"
+        )
         pdf.multi_cell(0, 6, f"예측 기간: {start_str} ~ {end_str}", border=0, align="L")
         pdf.ln(3)
 
@@ -717,11 +740,11 @@ def generate_bill_pdf(report_data, comparison_df=None):
         min_time_str = min_time.strftime("%Y-%m-%d %H:%M") if pd.notna(min_time) else "N/A"
 
         pdf.set_x(10)
-        pdf.multi_cell(col_width, 6, f"  - 12월 최대 요금적용전력: {peak_kw:,.2f} kW", border=0, align="L")
+        pdf.multi_cell(col_width, 6, f"  - {month_label} 최대 요금적용전력: {peak_kw:,.2f} kW", border=0, align="L")
         pdf.set_x(10)
         pdf.multi_cell(col_width, 6, f"  - 최대치 발생일시: {peak_time_str}", border=0, align="L")
         pdf.set_x(10)
-        pdf.multi_cell(col_width, 6, f"  - 12월 최저 요금적용전력: {min_kw:,.2f} kW", border=0, align="L")
+        pdf.multi_cell(col_width, 6, f"  - {month_label} 최저 요금적용전력: {min_kw:,.2f} kW", border=0, align="L")
         pdf.set_x(10)
         pdf.multi_cell(col_width, 6, f"  - 최저치 발생일시: {min_time_str}", border=0, align="L")
 
@@ -785,7 +808,7 @@ def generate_bill_pdf(report_data, comparison_df=None):
                 pdf.set_font("Nanum", "B", 8)
                 pdf.set_x(start_x)
                 pdf.cell(w_time, cell_h, "시간", 1, 0, "C", 1)
-                pdf.cell(w_nov, cell_h, "11월 평균", 1, 0, "C", 1)
+                pdf.cell(w_nov, cell_h, base_label, 1, 0, "C", 1)
                 pdf.cell(w_yes, cell_h, yesterday_header, 1, 0, "C", 1)
                 pdf.cell(w_tod, cell_h, today_header, 1, 0, "C", 1)
                 pdf.cell(w_diff, cell_h, "전일 대비", 1, 0, "C", 1)
@@ -806,7 +829,7 @@ def generate_bill_pdf(report_data, comparison_df=None):
                 row_left = comparison_df.iloc[i]
                 pdf.set_x(10)
                 pdf.cell(w_time, cell_h, str(i), 1, 0, "C")
-                pdf.cell(w_nov, cell_h, fmt(row_left["11월 평균"]), 1, 0, "R")
+                pdf.cell(w_nov, cell_h, fmt(row_left[base_label]), 1, 0, "R")
                 pdf.cell(w_yes, cell_h, fmt(row_left["어제"]), 1, 0, "R")
                 pdf.cell(w_tod, cell_h, fmt(row_left["오늘"]), 1, 0, "R")
                 pdf.cell(w_diff, cell_h, fmt(row_left["전일 대비"], True), 1, 0, "R")
@@ -814,7 +837,7 @@ def generate_bill_pdf(report_data, comparison_df=None):
                 row_right = comparison_df.iloc[i + 12]
                 pdf.set_x(10 + 95)
                 pdf.cell(w_time, cell_h, str(i + 12), 1, 0, "C")
-                pdf.cell(w_nov, cell_h, fmt(row_right["11월 평균"]), 1, 0, "R")
+                pdf.cell(w_nov, cell_h, fmt(row_right[base_label]), 1, 0, "R")
                 pdf.cell(w_yes, cell_h, fmt(row_right["어제"]), 1, 0, "R")
                 pdf.cell(w_tod, cell_h, fmt(row_right["오늘"]), 1, 0, "R")
                 pdf.cell(w_diff, cell_h, fmt(row_right["전일 대비"], True), 1, 0, "R")
@@ -839,7 +862,7 @@ def generate_bill_pdf(report_data, comparison_df=None):
         pdf.multi_cell(
             0,
             5,
-            "* 본 명세서는 '12월 전기요금 실시간 예측 시뮬레이션'을 통해 생성된 예측값이며, "
+            f"* 본 명세서는 '{month_label} 전기요금 실시간 예측 시뮬레이션'을 통해 생성된 예측값이며, "
             "실제 청구되는 요금과 다를 수 있습니다.\n"
             "* 예측 모델: LightGBM, XGBoost, CatBoost 앙상블 모델",
             border=1,
@@ -994,8 +1017,8 @@ if df.empty:
     month_key = pd.Period(datetime.now(), "M")
 else:
     month_periods = df["timestamp"].dt.to_period("M")
-    nov_candidates = month_periods[df["timestamp"].dt.month == 11]
-    month_key = nov_candidates.iloc[-1] if not nov_candidates.empty else month_periods.iloc[-1]
+    target_candidates = month_periods[df["timestamp"].dt.month == REPORT_MONTH]
+    month_key = target_candidates.iloc[-1] if not target_candidates.empty else month_periods.iloc[-1]
 
 this_month = df[df["timestamp"].dt.to_period("M") == month_key]
 prev_month = df[df["timestamp"].dt.to_period("M") == (month_key - 1)]
@@ -2070,18 +2093,19 @@ with bill_tab:
     st.subheader("한전 고지서 구성 기반 요금 계산기")
     if bill_inputs.tariff_label:
         st.caption(f"현재 요금제: {bill_inputs.tariff_label} (기본요금 {bill_inputs.basic_charge_per_kw:,.0f} 원/kW)")
+
     m = this_month.copy()
     if "timestamp" not in m.columns and "측정일시" in m.columns:
         m = m.rename(columns={"측정일시": "timestamp"})
     m["timestamp"] = pd.to_datetime(m["timestamp"], errors="coerce")
     m = m.dropna(subset=["timestamp"])
+
     if "kWh" not in m.columns and "pred_kwh" in m.columns:
         m["kWh"] = pd.to_numeric(m["pred_kwh"], errors="coerce")
     m["kWh"] = pd.to_numeric(m.get("kWh", 0.0), errors="coerce").fillna(0.0)
     if "unit_price" not in m.columns and "pred_fee" in m.columns:
         base_usage = m["kWh"].replace(0, np.nan)
-        derived_price = pd.to_numeric(m["pred_fee"], errors="coerce") / base_usage
-        m["unit_price"] = derived_price
+        m["unit_price"] = pd.to_numeric(m["pred_fee"], errors="coerce") / base_usage
     m["unit_price"] = pd.to_numeric(m.get("unit_price", 0.0), errors="coerce").fillna(0.0)
     m["hour"] = m["timestamp"].dt.hour
     day_mask = (m["hour"] >= 9) & (m["hour"] < 23)
@@ -2119,6 +2143,21 @@ with bill_tab:
     m["pf_penalty_amt"] = m["kWh"] * m["unit_price"] * (m["pf_penalty_pct"] / 100.0)
     pf_penalty_amount = float(np.nan_to_num(m["pf_penalty_amt"].sum(), nan=0.0))
 
+    if len(m) > 1:
+        interval_seconds = (
+            m["timestamp"].sort_values().diff().dropna().dt.total_seconds().mode()
+        )
+        step_hours = float(interval_seconds.iloc[0] / 3600.0) if not interval_seconds.empty else 1.0
+    else:
+        step_hours = 1.0
+
+    day_penalty_hours = float(np.sum(day_mask & (ground_pf < 90)) * step_hours)
+    day_bonus_hours = float(np.sum(day_mask & (ground_pf >= 95)) * step_hours)
+    night_penalty_hours = float(np.sum((~day_mask) & (lead_pf < 95)) * step_hours)
+
+    avg_day_pf_value = float(np.nanmean(ground_pf[day_mask])) if day_mask.any() else 0.0
+    avg_night_pf_value = float(np.nanmean(lead_pf[~day_mask])) if (~day_mask).any() else 0.0
+
     tou_energy = (
         m.assign(energy_value=m["kWh"] * m["unit_price"])
         .groupby("TOU", dropna=False)
@@ -2140,12 +2179,33 @@ with bill_tab:
     total_bill = basic_charge + energy_charge + pf_penalty_amount + vat_amt
 
     try:
-        r_full = df.set_index("timestamp")["kW"].rolling("1h").mean()
+        r_full = m.set_index("timestamp")["kW"].rolling("1h").mean()
         peak_val_full = float(r_full.max()) if len(r_full) else np.nan
         peak_ts = r_full.idxmax() if len(r_full) else None
     except KeyError:
         peak_val_full = np.nan
         peak_ts = None
+
+    if "kW" in m.columns and not m["kW"].dropna().empty:
+        min_idx = m["kW"].idxmin()
+        min_kw = float(m.loc[min_idx, "kW"])
+        min_time = m.loc[min_idx, "timestamp"]
+    else:
+        min_kw = 0.0
+        min_time = pd.NaT
+
+    if not m.empty:
+        period_start_ts = m["timestamp"].min()
+        period_end_ts = m["timestamp"].max()
+    else:
+        period_start_ts = df["timestamp"].min()
+        period_end_ts = df["timestamp"].max()
+
+    report_date_ts = period_end_ts if isinstance(period_end_ts, pd.Timestamp) else pd.Timestamp(datetime.now())
+    yesterday_dt = report_date_ts - pd.Timedelta(days=1)
+    yesterday_str = yesterday_dt.strftime("%m-%d") if isinstance(report_date_ts, pd.Timestamp) else ""
+    today_str = report_date_ts.strftime("%m-%d") if isinstance(report_date_ts, pd.Timestamp) else ""
+    report_month_label = f"{month_key.month}월"
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("기본요금", f"{basic_charge:,.0f}원")
@@ -2162,39 +2222,78 @@ with bill_tab:
         use_container_width=True
     )
 
+    # =========================================
+    # PDF 다운로드 (app.py 동일 포맷)
+    # =========================================
+    results_df = m.copy() if not m.empty else df.copy()
+    results_df = results_df.rename(columns={"timestamp": "측정일시"})
+    results_df["측정일시"] = pd.to_datetime(results_df["측정일시"], errors="coerce")
+    results_df["시간"] = results_df["측정일시"].dt.hour
+    results_df["월"] = results_df["측정일시"].dt.month
+    results_df["예측요금(원)"] = results_df["unit_price"] * results_df["kWh"]
+
+    try:
+        train_df = pd.read_csv("./data/train_.csv")
+        train_df["측정일시"] = pd.to_datetime(train_df["측정일시"], errors="coerce")
+        train_df["월"] = train_df["측정일시"].dt.month
+        train_df["시간"] = train_df["측정일시"].dt.hour
+    except FileNotFoundError:
+        st.warning("train_.csv를 찾을 수 없어 임시 학습 데이터를 생성합니다.")
+        train_df = pd.DataFrame(
+            {
+                "측정일시": pd.date_range(datetime.now() - timedelta(days=30), periods=720, freq="H"),
+                "월": [11] * 720,
+                "시간": [i % 24 for i in range(720)],
+                "전기요금(원)": np.random.randint(1000, 3000, size=720),
+            }
+        )
+
+    comparison_df, comparison_base_label = create_comparison_table_data(
+        train_df, results_df, target_month=month_key.month
+    )
+
+    report_data = {
+        "total_bill": total_bill,
+        "total_usage": total_kwh_month,
+        "period_start": period_start_ts,
+        "period_end": period_end_ts,
+        "report_date": report_date_ts,
+        "usage_by_band": tou_energy.set_index("TOU")["kWh"].to_dict(),
+        "bill_by_band": tou_energy.set_index("TOU")["energy_charge"].to_dict(),
+        "peak_demand_kw": peak_val_full,
+        "peak_demand_time": peak_ts,
+        "min_demand_kw": min_kw,
+        "min_demand_time": min_time,
+        "avg_day_pf": avg_day_pf_value,
+        "penalty_day_hours": day_penalty_hours,
+        "bonus_day_hours": day_bonus_hours,
+        "avg_night_pf": avg_night_pf_value,
+        "penalty_night_hours": night_penalty_hours,
+        "yesterday_str": yesterday_str,
+        "today_str": today_str,
+        "report_month_label": report_month_label,
+        "comparison_base_label": comparison_base_label,
+    }
+
+    pdf_bytes = generate_bill_pdf(report_data, comparison_df)
+    pdf_filename = f"predicted_bill_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+    st.session_state["sidebar_pdf_payload"] = {
+        "bytes": pdf_bytes,
+        "name": pdf_filename,
+    } if pdf_bytes else None
+
 # =========================================
 # PDF 다운로드 (app.py 동일 포맷)
 # =========================================
-results_df = df.copy()
+results_df = m.copy() if not m.empty else df.copy()
 results_df = results_df.rename(columns={"timestamp": "측정일시"})
 results_df["측정일시"] = pd.to_datetime(results_df["측정일시"], errors="coerce")
 results_df["시간"] = results_df["측정일시"].dt.hour
 results_df["월"] = results_df["측정일시"].dt.month
 results_df["예측요금(원)"] = results_df["unit_price"] * results_df["kWh"]
 
-report_data = {
-    "total_bill": total_bill,
-    "total_usage": total_kwh_month,
-    "period_start": df["timestamp"].min(),
-    "period_end": df["timestamp"].max(),
-    "report_date": datetime.now(),
-    "usage_by_band": tou_energy.set_index("TOU")["kWh"].to_dict(),
-    "bill_by_band": tou_energy.set_index("TOU")["energy_charge"].to_dict(),
-    "peak_demand_kw": peak_val_full,
-    "peak_demand_time": peak_ts,
-    "min_demand_kw": float(df["kW"].min()),
-    "min_demand_time": df.loc[df["kW"].idxmin()]["timestamp"],
-    "avg_day_pf": np.random.uniform(90, 98),
-    "penalty_day_hours": np.random.randint(0, 5),
-    "bonus_day_hours": np.random.randint(0, 5),
-    "avg_night_pf": np.random.uniform(94, 99),
-    "penalty_night_hours": np.random.randint(0, 3),
-    "yesterday_str": (datetime.now() - timedelta(days=1)).strftime("%m-%d"),
-    "today_str": datetime.now().strftime("%m-%d"),
-}
-
 try:
-    train_df = pd.read_csv("./data/submission_formatted.csv")
+    train_df = pd.read_csv("./data/train_.csv")
     train_df["측정일시"] = pd.to_datetime(train_df["측정일시"], errors="coerce")
     train_df["월"] = train_df["측정일시"].dt.month
     train_df["시간"] = train_df["측정일시"].dt.hour
@@ -2209,7 +2308,33 @@ except FileNotFoundError:
         }
     )
 
-comparison_df = create_comparison_table_data(train_df, results_df)
+comparison_df, comparison_base_label = create_comparison_table_data(
+    train_df, results_df, target_month=month_key.month
+)
+
+report_data = {
+    "total_bill": total_bill,
+    "total_usage": total_kwh_month,
+    "period_start": period_start_ts,
+    "period_end": period_end_ts,
+    "report_date": report_date_ts,
+    "usage_by_band": tou_energy.set_index("TOU")["kWh"].to_dict(),
+    "bill_by_band": tou_energy.set_index("TOU")["energy_charge"].to_dict(),
+    "peak_demand_kw": peak_val_full,
+    "peak_demand_time": peak_ts,
+    "min_demand_kw": min_kw,
+    "min_demand_time": min_time,
+    "avg_day_pf": avg_day_pf_value,
+    "penalty_day_hours": day_penalty_hours,
+    "bonus_day_hours": day_bonus_hours,
+    "avg_night_pf": avg_night_pf_value,
+    "penalty_night_hours": night_penalty_hours,
+    "yesterday_str": yesterday_str,
+    "today_str": today_str,
+    "report_month_label": report_month_label,
+    "comparison_base_label": comparison_base_label,
+}
+
 pdf_bytes = generate_bill_pdf(report_data, comparison_df)
 pdf_filename = f"predicted_bill_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
 st.session_state["sidebar_pdf_payload"] = {
