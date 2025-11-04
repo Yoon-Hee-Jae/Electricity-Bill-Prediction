@@ -639,7 +639,7 @@ def generate_bill_pdf(report_data, comparison_df=None):
         pdf.cell(
             col_width,
             8,
-            f"청구서 발행일: {report_data['report_date'].strftime('%Y-%m-%d')}",
+            f"명세서 발행일: {report_data['report_date'].strftime('%Y-%m-%d')}",
             border=0,
             ln=1,
         )
@@ -2194,7 +2194,7 @@ report_data = {
 }
 
 try:
-    train_df = pd.read_csv("./data/train_.csv")
+    train_df = pd.read_csv("./data/submission_formatted.csv")
     train_df["측정일시"] = pd.to_datetime(train_df["측정일시"], errors="coerce")
     train_df["월"] = train_df["측정일시"].dt.month
     train_df["시간"] = train_df["측정일시"].dt.hour
