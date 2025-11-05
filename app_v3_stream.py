@@ -1106,6 +1106,9 @@ forecast_this_month = load_monthly_forecast_from_submission(
     bill_inputs.tariff_rates,
 )
 if not forecast_this_month.empty:
+    forecast_periods = forecast_this_month["timestamp"].dt.to_period("M")
+    month_key = forecast_periods.iloc[-1]
+    prev_month = df[df["timestamp"].dt.to_period("M") == (month_key - 1)]
     this_month = forecast_this_month
 
 # =========================================
