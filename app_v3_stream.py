@@ -533,6 +533,82 @@ def preprocess_data(df: pd.DataFrame, tariff_rates: Dict[str, Dict[str, float]])
     df["unit_price"] = df.apply(resolve_unit_price, axis=1).astype(float)
     return df
 
+def load_monthly_forecast_from_submission(
+    csv_path: Path,
+    report_month: int,
+    tariff_rates: Dict[str, Dict[str, float]],
+) -> pd.DataFrame:
+    """
+    submission_total.csv 기반 월간 예측 데이터를 불러와 표준 전처리 + 부가 정보 생성.
+    - 예측 kWh/요금을 활용해 unit_price를 재계산하고, 기본 요금제 기반 unit_price도 보존.
+    """
+    if not csv_path.exists():
+        return pd.DataFrame()
+
+    try:
+        raw = pd.read_csv(csv_path)
+    except Exception as e:
+        st.warning(f"예측 데이터({csv_path.name})를 읽는 중 오류가 발생했습니다: {e}")
+        return pd.DataFrame()
+
+    rename_map = {"측정일시": "timestamp"}
+    for src, dst in rename_map.items():
+        if src in raw.columns:
+            raw = raw.rename(columns={src: dst})
+
+    if "timestamp" not in raw.columns:
+        st.warning("예측 데이터에 'timestamp' 컬럼이 없어 연동할 수 없습니다.")
+        return pd.DataFrame()
+
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], errors="coerce")
+    raw = raw.dropna(subset=["timestamp"])
+    raw = raw[raw["timestamp"].dt.month == report_month]
+    if raw.empty:
+        return pd.DataFrame()
+
+    def _coerce_numeric(df: pd.DataFrame, col_candidates: List[str]) -> pd.Series:
+        for col in col_candidates:
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce")
+        return pd.Series(np.nan, index=df.index)
+
+    pred_kwh = _coerce_numeric(raw, ["pred_전력사용량(kWh)", "전력사용량(kWh)", "pred_kwh", "kWh"]).fillna(0.0)
+    pred_fee = _coerce_numeric(raw, ["pred_전기요금(원)", "전기요금(원)", "pred_fee"]).fillna(0.0)
+
+    raw["pred_kwh"] = pred_kwh
+    raw["pred_fee"] = pred_fee
+    raw["kWh"] = pred_kwh
+    raw["kW"] = np.where(raw["kWh"] > 0, raw["kWh"] / 0.25, 0.0)
+
+    base_df = raw[["timestamp", "kWh", "kW"]].copy()
+    processed = preprocess_data(base_df, tariff_rates)
+
+    forecast_cols = raw.drop(columns=["kWh", "kW"], errors="ignore")
+    merged = processed.merge(forecast_cols, on="timestamp", how="left")
+
+    merged["kWh"] = merged["kWh"].fillna(0.0)
+    merged["kW"] = merged["kW"].fillna(0.0)
+    merged["hour"] = merged["timestamp"].dt.hour
+    merged["pred_fee"] = merged["pred_fee"].fillna(0.0)
+
+    merged["unit_price_plan"] = merged["unit_price"].fillna(0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        unit_price_forecast = np.where(
+            merged["kWh"] > 0,
+            merged["pred_fee"] / merged["kWh"],
+            np.nan,
+        )
+    merged["unit_price_forecast"] = np.nan_to_num(unit_price_forecast, nan=0.0, posinf=0.0, neginf=0.0)
+    merged["unit_price"] = np.where(
+        merged["unit_price_forecast"] > 0,
+        merged["unit_price_forecast"],
+        merged["unit_price_plan"],
+    )
+
+    merged["forecast_source"] = csv_path.name
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
+    return merged
+
 def safe_sum(series: pd.Series) -> float:
     try: return float(series.sum())
     except Exception: return 0.0
@@ -1022,6 +1098,15 @@ else:
 
 this_month = df[df["timestamp"].dt.to_period("M") == month_key]
 prev_month = df[df["timestamp"].dt.to_period("M") == (month_key - 1)]
+
+forecast_path = Path("./data/submission_total.csv")
+forecast_this_month = load_monthly_forecast_from_submission(
+    forecast_path,
+    REPORT_MONTH,
+    bill_inputs.tariff_rates,
+)
+if not forecast_this_month.empty:
+    this_month = forecast_this_month
 
 # =========================================
 # Top Title and Logo
@@ -2059,32 +2144,51 @@ with feature_tab:
 # =========================================
 with alert_tab:
     st.subheader("피크 관리 및 예측(간이)")
-    r = df.set_index("timestamp")["kW"].rolling("1h").mean()
-    peak_val = float(r.max()) if len(r) else np.nan
-    peak_ts = r.idxmax() if len(r) else None
-    pct_of_contract = (peak_val / contract_power * 100) if contract_power and isinstance(peak_val,float) else np.nan
-    col1, col2, col3 = st.columns(3)
-    col1.metric("최근 1시간 최대수요(kW)", f"{peak_val:,.1f}" if isinstance(peak_val,float) and not math.isnan(peak_val) else "-")
-    col2.metric("발생 시각", peak_ts.strftime("%Y-%m-%d %H:%M") if isinstance(peak_ts, datetime) else "-")
-    col3.metric("계약대비(%)", f"{pct_of_contract:,.1f}%" if isinstance(pct_of_contract,float) and not math.isnan(pct_of_contract) else "-")
-    if isinstance(pct_of_contract,float) and not math.isnan(pct_of_contract) and pct_of_contract >= peak_alert_threshold:
-        st.error(f"계약전력 대비 {pct_of_contract:.1f}% → 피크 경보 (임계 {peak_alert_threshold}%)")
+    alert_df = this_month.copy() if not this_month.empty else df.copy()
+    if "timestamp" not in alert_df.columns:
+        st.info("분석 가능한 데이터가 없습니다.")
     else:
-        st.info(f"계약전력 대비 {pct_of_contract:.1f}%" if isinstance(pct_of_contract,float) else "계약전력 대비 계산 불가")
+        alert_df["timestamp"] = pd.to_datetime(alert_df["timestamp"], errors="coerce")
+        alert_df = alert_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+        if "kW" not in alert_df.columns and "kWh" in alert_df.columns:
+            alert_df["kW"] = pd.to_numeric(alert_df["kWh"], errors="coerce").fillna(0.0) / 0.25
+        alert_df["kW"] = pd.to_numeric(alert_df.get("kW", 0.0), errors="coerce").fillna(0.0)
 
-    st.markdown("**피크 시뮬레이션**")
-    sim_hour = st.slider("조치 적용 시간(시)", 0, 23, 14)
-    shed_percent = st.slider("차단율(%)", 0, 50, 20)
-    sim_df = this_month.copy(); mask = sim_df["hour"]==sim_hour
-    base_energy_cost = float((sim_df["kWh"] * sim_df["unit_price"]).sum()) if not sim_df.empty else 0.0
-    sim_df.loc[mask, "kWh"] *= (1 - shed_percent/100)
-    sim_energy_cost = float((sim_df["kWh"] * sim_df["unit_price"]).sum()) if not sim_df.empty else 0.0
-    st.success(f"{sim_hour}시 {shed_percent}% 차단 → 이번달 전력량요금 약 {base_energy_cost - sim_energy_cost:,.0f} 원 절감")
-    fig8 = go.Figure()
-    fig8.add_trace(go.Bar(x=this_month["hour"], y=this_month["kWh"], name="현재"))
-    fig8.add_trace(go.Bar(x=sim_df["hour"], y=sim_df["kWh"], name="시뮬레이션"))
-    fig8.update_layout(barmode="group", title="시간대별 kWh 변화")
-    st.plotly_chart(fig8, use_container_width=True)
+        r = alert_df.set_index("timestamp")["kW"].rolling("1h").mean()
+        peak_val = float(r.max()) if len(r) else np.nan
+        peak_ts = r.idxmax() if len(r) else None
+        pct_of_contract = (peak_val / contract_power * 100) if contract_power and isinstance(peak_val, float) else np.nan
+        col1, col2, col3 = st.columns(3)
+        col1.metric("최근 1시간 최대수요(kW)", f"{peak_val:,.1f}" if isinstance(peak_val,float) and not math.isnan(peak_val) else "-")
+        col2.metric("발생 시각", peak_ts.strftime("%Y-%m-%d %H:%M") if isinstance(peak_ts, datetime) else "-")
+        col3.metric("계약대비(%)", f"{pct_of_contract:,.1f}%" if isinstance(pct_of_contract,float) and not math.isnan(pct_of_contract) else "-")
+        if isinstance(pct_of_contract,float) and not math.isnan(pct_of_contract) and pct_of_contract >= peak_alert_threshold:
+            st.error(f"계약전력 대비 {pct_of_contract:.1f}% → 피크 경보 (임계 {peak_alert_threshold}%)")
+        else:
+            st.info(f"계약전력 대비 {pct_of_contract:.1f}%" if isinstance(pct_of_contract,float) else "계약전력 대비 계산 불가")
+
+        if not forecast_this_month.empty:
+            st.caption("📈 12월 예측 데이터(submission_total.csv) 기반 분석 결과입니다.")
+
+        st.markdown("**피크 시뮬레이션**")
+        sim_hour = st.slider("조치 적용 시간(시)", 0, 23, 14)
+        shed_percent = st.slider("차단율(%)", 0, 50, 20)
+        sim_df = alert_df.copy()
+        if "hour" not in sim_df.columns:
+            sim_df["hour"] = sim_df["timestamp"].dt.hour
+        mask = sim_df["hour"] == sim_hour
+        sim_df["unit_price"] = pd.to_numeric(sim_df.get("unit_price", 0.0), errors="coerce").fillna(0.0)
+        sim_df["kWh"] = pd.to_numeric(sim_df.get("kWh", 0.0), errors="coerce").fillna(0.0)
+
+        base_energy_cost = float((sim_df["kWh"] * sim_df["unit_price"]).sum()) if not sim_df.empty else 0.0
+        sim_df.loc[mask, "kWh"] *= (1 - shed_percent/100)
+        sim_energy_cost = float((sim_df["kWh"] * sim_df["unit_price"]).sum()) if not sim_df.empty else 0.0
+        st.success(f"{sim_hour}시 {shed_percent}% 차단 → 이번달 전력량요금 약 {base_energy_cost - sim_energy_cost:,.0f} 원 절감")
+        fig8 = go.Figure()
+        fig8.add_trace(go.Bar(x=alert_df["hour"], y=alert_df["kWh"], name="현재"))
+        fig8.add_trace(go.Bar(x=sim_df["hour"], y=sim_df["kWh"], name="시뮬레이션"))
+        fig8.update_layout(barmode="group", title="시간대별 kWh 변화")
+        st.plotly_chart(fig8, use_container_width=True)
 
 # =========================================
 # KEPCO Bill
