@@ -1,9 +1,5 @@
 # LS_project
 
 
-5조 화이팅~!~!
-
-안태경
-오정민
-윤희재
-진소현
+# 전기 요금 대시보드 링크
+https://electricity-bill-prediction.streamlit.app/
